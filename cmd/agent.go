@@ -234,7 +234,7 @@ func (a *Agent) pg2pulsar(params *structpb.Struct) (*pb.AgentConfigResponse, err
 }
 
 func (a *Agent) pulsar2pg(params *structpb.Struct) (*pb.AgentConfigResponse, error) {
-	v, err := extract(params, "PGConnURL", "PulsarURL", "PulsarTopic", "?PGLogPath", "?BatchTxSize", "?ReaderPrefix")
+	v, err := extract(params, "PGConnURL", "PulsarURL", "PulsarTopic", "?PGLogPath", "?BatchTxSize", "?ReaderPrefix", "?MaxSpoolBytes")
 	if err != nil {
 		return nil, err
 	}
@@ -246,7 +246,12 @@ func (a *Agent) pulsar2pg(params *structpb.Struct) (*pb.AgentConfigResponse, err
 		return nil, errors.New("BatchTxSize should be a positive integer")
 	}
 
-	pgSink := &sink.PGXSink{ConnStr: v["PGConnURL"].GetStringValue(), SourceID: trimSlot(v["PulsarTopic"].GetStringValue()), Renice: AgentRenice, LogReader: nil, BatchTXSize: int(batchTXSize)}
+	maxSpoolBytes := int64(v["MaxSpoolBytes"].GetNumberValue())
+	if maxSpoolBytes < 0 {
+		return nil, errors.New("MaxSpoolBytes should be a non-negative integer")
+	}
+
+	pgSink := &sink.PGXSink{ConnStr: v["PGConnURL"].GetStringValue(), SourceID: trimSlot(v["PulsarTopic"].GetStringValue()), Renice: AgentRenice, LogReader: nil, BatchTXSize: int(batchTXSize), MaxSpoolBytes: maxSpoolBytes}
 	if path := v["PGLogPath"].GetStringValue(); path != "" {
 		pgLog, err := os.Open(path)
 		if err != nil {

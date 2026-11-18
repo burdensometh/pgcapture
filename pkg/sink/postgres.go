@@ -20,6 +20,7 @@ import (
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgproto3"
 	"github.com/jackc/pgx/v5/pgtype"
 	pg_query "github.com/pganalyze/pg_query_go/v2"
 	"github.com/replicase/pgcapture/pkg/cursor"
@@ -33,11 +34,15 @@ import (
 type PGXSink struct {
 	BaseSink
 
-	ConnStr     string
-	SourceID    string
-	Renice      int64
-	LogReader   io.Reader
-	BatchTXSize int
+	ConnStr       string
+	SourceID      string
+	Renice        int64
+	LogReader     io.Reader
+	BatchTXSize   int
+	MaxSpoolBytes int64
+	// InsertBatchSize caps how many consecutive INSERT changes are coalesced
+	// into one multi-row INSERT statement. Zero keeps the built-in default.
+	InsertBatchSize int
 
 	conn           *pgx.Conn
 	raw            *pgconn.PgConn
@@ -54,6 +59,46 @@ type PGXSink struct {
 	inTX           bool
 	pendingChanges []pendingChange
 	pendingCommits []pendingCommit
+	// spoolBytes is the estimated serialized size of the changes still held in
+	// pendingChanges (including the ones already streamed to the server inside
+	// the open explicit transaction, whose client-side buffers have been
+	// released), so it reflects the total buffered volume of the current batch.
+	spoolBytes int64
+	// spoolHighWater is the largest resident spoolBytes observed since the last
+	// batch boundary; it lets operators and tests verify the byte budget actually
+	// bounds memory for very large source transactions.
+	spoolHighWater int64
+	// streamedSpoolBytes counts bytes already streamed to the server within the
+	// open explicit transaction but not yet committed; it is reset when a batch
+	// transaction closes.
+	streamedSpoolBytes int64
+	// txOpen reports whether an explicit SQL transaction (BEGIN) is currently in
+	// progress on the pipeline. Every batch is wrapped in BEGIN/COMMIT so that
+	// data changes and the pgcapture.sources checkpoint update commit atomically.
+	txOpen bool
+	// fatal marks the sink as unable to continue (e.g. the pipeline failed and
+	// the connection is unusable); subsequent source messages are rejected
+	// instead of dereferencing a dead pipeline, so the apply loop terminates and
+	// no uncommitted spool can be mistaken for applied work.
+	fatal bool
+}
+
+// DefaultMaxSpoolBytes caps the estimated in-memory size of the changes spooled
+// for a batch. When the cap is exceeded, pending changes are streamed to the
+// server inside the still-open explicit transaction and their client-side
+// buffers are released; the transaction is never committed until the source
+// transaction's commit and checkpoint update are queued.
+const DefaultMaxSpoolBytes int64 = 32 * 1024 * 1024
+
+// defaultInsertBatchSize is the maximum number of consecutive INSERT changes
+// coalesced into a single multi-row INSERT statement.
+const defaultInsertBatchSize = 2500
+
+func (p *PGXSink) maxSpoolBytes() int64 {
+	if p.MaxSpoolBytes > 0 {
+		return p.MaxSpoolBytes
+	}
+	return DefaultMaxSpoolBytes
 }
 
 type insertBatch struct {
@@ -86,6 +131,84 @@ type pendingChange struct {
 	paramOIDs     []uint32
 	paramFormats  []int16
 	resultFormats []int16
+	// size is the estimated number of bytes this change keeps in memory (SQL
+	// text plus every parameter value and the per-parameter metadata).
+	size int64
+}
+
+// changeSize estimates the retained memory of a pending change. It is a byte
+// budget rather than an exact accounting: the actual wire encoding also
+// includes protocol headers, but those are proportional to the payload and are
+// bounded by the same flush threshold.
+func changeSize(sql string, args [][]byte, paramOIDs []uint32, paramFormats, resultFormats []int16) int64 {
+	n := int64(len(sql))
+	for _, arg := range args {
+		n += int64(len(arg))
+	}
+	n += int64(cap(paramOIDs)) * int64(unsafe.Sizeof(uint32(0)))
+	n += int64(cap(paramFormats)) * int64(unsafe.Sizeof(int16(0)))
+	n += int64(cap(resultFormats)) * int64(unsafe.Sizeof(int16(0)))
+	return n
+}
+
+// queueChange appends a change to the in-memory spool. When the spool exceeds
+// the configured byte budget, the buffered changes are streamed to the server
+// inside the still-open explicit transaction and their client-side buffers are
+// released. A Flush (not a Sync) is used, so the synchronization point does not
+// commit the transaction: the whole source transaction stays invisible until
+// its COMMIT and checkpoint update are flushed together at batch end.
+func (p *PGXSink) queueChange(c pendingChange) error {
+	c.size = changeSize(c.sql, c.args, c.paramOIDs, c.paramFormats, c.resultFormats)
+	p.pendingChanges = append(p.pendingChanges, c)
+	p.spoolBytes += c.size
+	if p.spoolBytes > p.spoolHighWater {
+		p.spoolHighWater = p.spoolBytes
+	}
+	if p.spoolBytes < p.maxSpoolBytes() {
+		return nil
+	}
+	return p.streamSpool()
+}
+
+// streamSpool sends every buffered change over the pipeline and releases the
+// client-side buffers. It sends a protocol Flush but never a Sync, so the
+// server starts executing the queued requests and releases its input buffers
+// while the open explicit transaction stays open and uncommitted regardless of
+// how often the budget is hit.
+func (p *PGXSink) streamSpool() error {
+	if len(p.pendingChanges) == 0 {
+		return nil
+	}
+	for _, q := range p.pendingChanges {
+		p.pipeline.SendQueryParams(q.sql, q.args, q.paramOIDs, q.paramFormats, q.resultFormats)
+	}
+	n := int64(0)
+	for _, q := range p.pendingChanges {
+		n += q.size
+	}
+	// a protocol Flush (not a Sync) tells the server to process the queued
+	// requests without establishing a synchronization point, hence the explicit
+	// transaction cannot commit here; Pipeline.Flush then pushes the bytes out.
+	p.raw.Frontend().Send(&pgproto3.Flush{})
+	if err := p.pipeline.Flush(); err != nil {
+		p.markFatal()
+		return err
+	}
+	p.streamedSpoolBytes += n
+	p.resetPendingChanges()
+	p.log.WithFields(logrus.Fields{
+		"StreamedBytes": p.streamedSpoolBytes,
+	}).Debug("spool byte budget reached, streamed pending changes inside open transaction")
+	return nil
+}
+
+// resetPendingChanges drops every buffered change and its byte accounting.
+func (p *PGXSink) resetPendingChanges() {
+	for i := range p.pendingChanges {
+		p.pendingChanges[i] = pendingChange{}
+	}
+	p.pendingChanges = p.pendingChanges[:0]
+	p.spoolBytes = 0
 }
 
 type pendingCommit struct {
@@ -105,7 +228,11 @@ func (p *PGXSink) Setup() (cp cursor.Checkpoint, err error) {
 		return cp, err
 	}
 	p.raw = p.conn.PgConn()
-	p.inserts.records = make([][]*pb.Field, 2500)
+	insertBatchSize := p.InsertBatchSize
+	if insertBatchSize <= 0 {
+		insertBatchSize = defaultInsertBatchSize
+	}
+	p.inserts.records = make([][]*pb.Field, insertBatchSize)
 	p.pgSrcID = pgText(p.SourceID)
 	p.replLag = -1
 
@@ -136,13 +263,26 @@ func (p *PGXSink) Setup() (cp cursor.Checkpoint, err error) {
 	}
 
 	p.BaseSink.CleanFn = func() {
+		// best-effort: roll back any uncommitted explicit transaction so that a
+		// stopped sink never leaves half of a source transaction applied. On
+		// failure the connection is simply closed and the server discards the
+		// open transaction automatically.
+		if p.txOpen && p.conn != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if _, err := p.conn.Exec(ctx, "ROLLBACK"); err != nil {
+				p.log.WithError(err).Warn("failed to rollback uncommitted spooled transaction on cleanup")
+			}
+			cancel()
+			p.txOpen = false
+		}
 		p.conn.Close(context.Background())
 	}
 
 	p.log = logrus.WithFields(logrus.Fields{
-		"From":        "PGXSink",
-		"SourceID":    p.SourceID,
-		"BatchTxSize": p.BatchTXSize,
+		"From":          "PGXSink",
+		"SourceID":      p.SourceID,
+		"BatchTxSize":   p.BatchTXSize,
+		"MaxSpoolBytes": p.maxSpoolBytes(),
 	})
 
 	p.pendingCommits = make([]pendingCommit, 0, p.BatchTXSize)
@@ -207,6 +347,9 @@ func (p *PGXSink) findCheckpoint(ctx context.Context) (cp cursor.Checkpoint, err
 func (p *PGXSink) Apply(changes chan source.Change) chan cursor.Checkpoint {
 	var first bool
 	return p.BaseSink.apply(changes, func(sourceRemaining int, change source.Change, committed chan cursor.Checkpoint) (err error) {
+		if p.fatal {
+			return fmt.Errorf("PGXSink is in a fatal state and cannot apply message at LSN %d", change.Checkpoint.LSN)
+		}
 		if !first {
 			p.log.WithFields(logrus.Fields{
 				"MessageLSN":  change.Checkpoint.LSN,
@@ -223,7 +366,7 @@ func (p *PGXSink) Apply(changes chan source.Change) chan cursor.Checkpoint {
 					"MessageLSN": change.Checkpoint.LSN,
 					"MidHex":     hex.EncodeToString(change.Checkpoint.Data),
 				}).Warn("receive incomplete transaction: begin")
-				p.pendingChanges = p.pendingChanges[:0]
+				p.resetPendingChanges()
 				break
 			}
 			p.inTX = true
@@ -378,8 +521,13 @@ parse:
 }
 
 func (p *PGXSink) performDDL(ddl string) (err error) {
-	p.pendingChanges = p.pendingChanges[:0]
-	if err = p.endPipeline(); err != nil {
+	// DDL mixed with DML in the same source transaction: any DML already spooled
+	// for relations touched by the DDL is dropped (see handleDDL), so discard the
+	// whole spool. If an explicit transaction is open, roll it back first so no
+	// half-applied DML survives, then run the DDL on its own connection cycle and
+	// start a fresh explicit transaction for the rest of the batch.
+	p.resetPendingChanges()
+	if err = p.endPipeline(true); err != nil {
 		return err
 	}
 	if _, err = p.conn.Exec(context.Background(), ddl); err != nil {
@@ -398,7 +546,10 @@ func (p *PGXSink) flushInsert() (err error) {
 		return nil
 	}
 
-	info, _ := p.schema.GetColumnInfo(p.inserts.Schema, p.inserts.Table)
+	info, err := p.schema.GetColumnInfo(p.inserts.Schema, p.inserts.Table)
+	if err != nil {
+		return err
+	}
 	cols, filtered := info.Filter(batch[0], func(i decode.ColumnInfo, field string) bool {
 		return !i.IsGenerated(field)
 	})
@@ -449,14 +600,13 @@ func (p *PGXSink) flushInsert() (err error) {
 		PGVersion: p.pgVersion,
 	}
 
-	p.pendingChanges = append(p.pendingChanges, pendingChange{
+	return p.queueChange(pendingChange{
 		sql:           sql.InsertQuery(opt),
 		args:          vals,
 		paramOIDs:     oids,
 		paramFormats:  fmts,
 		resultFormats: rets,
 	})
-	return
 }
 
 func (p *PGXSink) handleInsert(m *pb.Change) (err error) {
@@ -494,14 +644,13 @@ func (p *PGXSink) handleDelete(m *pb.Change) (err error) {
 			oids[i] = 0
 		}
 	}
-	p.pendingChanges = append(p.pendingChanges, pendingChange{
+	return p.queueChange(pendingChange{
 		sql:           sql.DeleteQuery(m.Schema, m.Table, m.Old),
 		args:          vals,
 		paramOIDs:     oids,
 		paramFormats:  fmts,
 		resultFormats: fmts,
 	})
-	return
 }
 
 func (p *PGXSink) handleUpdate(m *pb.Change) (err error) {
@@ -582,14 +731,13 @@ func (p *PGXSink) handleUpdate(m *pb.Change) (err error) {
 		}
 	}
 
-	p.pendingChanges = append(p.pendingChanges, pendingChange{
+	return p.queueChange(pendingChange{
 		sql:           sql.UpdateQuery(m.Schema, m.Table, sets, keys),
 		args:          vals,
 		paramOIDs:     oids,
 		paramFormats:  fmts,
 		resultFormats: fmts,
 	})
-	return
 }
 
 const (
@@ -601,10 +749,12 @@ func (p *PGXSink) handleCommit(sourceRemaining int, cp cursor.Checkpoint, commit
 		return err
 	}
 
-	for _, q := range p.pendingChanges {
-		p.pipeline.SendQueryParams(q.sql, q.args, q.paramOIDs, q.paramFormats, q.resultFormats)
+	// stream any changes still held client-side (small transactions normally
+	// reach this point without ever hitting the byte budget). This only flushes;
+	// the explicit transaction remains open and uncommitted.
+	if err = p.streamSpool(); err != nil {
+		return err
 	}
-	p.pendingChanges = p.pendingChanges[:0]
 	p.pendingCommits = append(p.pendingCommits, pendingCommit{
 		checkPoint: cp,
 		commit:     commit,
@@ -641,7 +791,12 @@ func (p *PGXSink) handleCommit(sourceRemaining int, cp cursor.Checkpoint, commit
 			return err
 		}
 		p.pipeline.SendQueryParams(UpdateSourceSQL, [][]byte{cmt, seq, mid, cmtTs, id}, []uint32{0, pgtype.Int4OID, pgtype.ByteaOID, pgtype.TimestamptzOID, pgtype.TextOID}, []int16{pgtype.TextFormatCode, pgtype.BinaryFormatCode, pgtype.BinaryFormatCode, pgtype.BinaryFormatCode, pgtype.BinaryFormatCode}, []int16{pgtype.TextFormatCode, pgtype.BinaryFormatCode, pgtype.BinaryFormatCode, pgtype.BinaryFormatCode, pgtype.BinaryFormatCode})
-		err = p.endPipeline()
+		// COMMIT closes the explicit transaction opened in startPipeline, so the
+		// batched data changes and the checkpoint update become visible and
+		// durable atomically: readers see the complete old state before this
+		// point and the complete new state afterwards.
+		p.pipeline.SendQueryParams("COMMIT", nil, nil, nil, nil)
+		err = p.endPipeline(false)
 	}
 	return
 }
@@ -649,20 +804,61 @@ func (p *PGXSink) handleCommit(sourceRemaining int, cp cursor.Checkpoint, commit
 func (p *PGXSink) startPipeline() {
 	if p.pipeline == nil {
 		p.pipeline = p.raw.StartPipeline(context.Background())
+		// wrap the whole batch in one explicit SQL transaction. A Sync only
+		// establishes a protocol synchronization point inside this transaction;
+		// it cannot implicitly commit it, so mid-batch flushes never expose half
+		// of a source transaction.
+		p.pipeline.SendQueryParams("BEGIN", nil, nil, nil, nil)
+		p.txOpen = true
+		p.streamedSpoolBytes = 0
+		// start a fresh resident-memory observation window for this batch
+		p.spoolHighWater = 0
 	}
 }
 
-func (p *PGXSink) endPipeline() (err error) {
-	if err = p.pipeline.Sync(); err != nil {
-		return err
+// endPipeline closes the current pipeline. When rollback is true the open
+// explicit transaction is rolled back instead of committed, which discards
+// every streamed but uncommitted change (used when a DDL statement forces a
+// pipeline boundary or when the spool must be abandoned). The checkpoint rows
+// in pendingCommits are only acknowledged to the source after a successful
+// commit, so a failure or restart makes the source replay from the last
+// safely committed checkpoint.
+func (p *PGXSink) endPipeline(rollback bool) (err error) {
+	if p.pipeline == nil {
+		return nil
+	}
+	if p.txOpen && rollback {
+		p.pipeline.SendQueryParams("ROLLBACK", nil, nil, nil, nil)
+	}
+	if p.txOpen {
+		if err = p.pipeline.Sync(); err != nil {
+			p.markFatal()
+			return err
+		}
 	}
 	if err = p.pipeline.Close(); err != nil {
+		// Close drains the queued results and is where server-side failures
+		// (constraint violations, missing relations, ...) surface. The explicit
+		// transaction is rolled back by the server, nothing is committed, and
+		// the connection must not be reused: mark the sink fatal so the source
+		// replays from the last safe checkpoint after a restart.
+		p.markFatal()
 		return err
+	}
+	p.pipeline = nil
+	p.txOpen = false
+	p.streamedSpoolBytes = 0
+	p.resetPendingChanges()
+	if rollback {
+		// the discarded changes were never durably committed and their
+		// checkpoints must not be acknowledged; the source will replay them
+		// after the restart from the last committed checkpoint.
+		p.pendingCommits = p.pendingCommits[:0]
+		return
 	}
 	if len(p.pendingCommits) != 0 {
 		atomic.StoreInt64(&p.replLag, time.Since(pgTz(p.pendingCommits[len(p.pendingCommits)-1].commit.CommitTime).Time).Milliseconds())
 	}
-	p.pipeline = nil
 	for _, commit := range p.pendingCommits {
 		p.committed <- commit.checkPoint
 	}
@@ -670,8 +866,26 @@ func (p *PGXSink) endPipeline() (err error) {
 	return
 }
 
+// markFatal disables further message processing and drops the dead pipeline.
+// Any uncommitted spool is discarded in memory; the open SQL transaction (if
+// any) is left for CleanFn to roll back best-effort on Stop, or it is discarded
+// automatically by the server when the connection closes.
+func (p *PGXSink) markFatal() {
+	p.fatal = true
+	p.pipeline = nil
+	p.streamedSpoolBytes = 0
+	p.resetPendingChanges()
+}
+
 func (p *PGXSink) ReplicationLagMilliseconds() int64 {
 	return atomic.LoadInt64(&p.replLag)
+}
+
+// SpoolHighWaterBytes returns the largest resident spool size observed since
+// the last committed batch boundary, confirming the byte budget keeps memory
+// bounded even for source transactions that stream many times.
+func (p *PGXSink) SpoolHighWaterBytes() int64 {
+	return p.spoolHighWater
 }
 
 func ScanCheckpointFromLog(f io.Reader) (lsn, ts string, err error) {

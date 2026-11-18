@@ -173,10 +173,12 @@ func TestPGXSink(t *testing.T) {
 			validateCommitted(t, committed, commitCheckpoint)
 		},
 		reset: func(t *testing.T) {
+			// close the input channel first so the apply goroutine can finish
+			// draining and fully exit before the sink is re-armed in place
+			close(changes)
 			if err = resetPGSink(sink, batchTxSize); err != nil {
 				t.Fatalf("reset sink failed: %v", err)
 			}
-			close(changes)
 			changes = make(chan source.Change, 100)
 		},
 	})
@@ -224,24 +226,28 @@ func TestPGXSink(t *testing.T) {
 		},
 	}
 
-	// test multiple tx in a single pipeline
+	// test multiple tx in a single pipeline. The pipeline is additionally wrapped
+	// in an explicit BEGIN/COMMIT so that the batched data and the checkpoint
+	// update commit atomically, which adds one Parse/Bind/Describe/Execute pair
+	// each on top of the 4 DML statements.
 	doTxs(tasks, func(t *testing.T, commitCheckpoints ...cursor.Checkpoint) {
 		var traceBuffer bytes.Buffer
 		sink.raw.Frontend().Trace(&traceBuffer, pgproto3.TracerOptions{SuppressTimestamps: true})
 		committed := sink.Apply(changes)
 		validateCommitted(t, committed, commitCheckpoints...)
 		validatePipeline(t, &traceBuffer, validatePipelineOption{
-			expectedParseCount:    4,
-			expectedBindCount:     4,
-			expectedDescribeCount: 4,
-			expectedExecuteCount:  4,
+			expectedParseCount:    6,
+			expectedBindCount:     6,
+			expectedDescribeCount: 6,
+			expectedExecuteCount:  6,
 			expectedSyncCount:     1,
 		})
 	}, func(t *testing.T) {
+		// close the input channel before re-arming so the apply goroutine exits
+		close(changes)
 		if err := resetPGSink(sink, batchTxSize); err != nil {
 			t.Fatalf("reset sink failed: %v", err)
 		}
-		close(changes)
 		changes = make(chan source.Change, 100)
 	})
 
@@ -643,7 +649,43 @@ func resetPGSink(sink *PGXSink, batchTxSize int) error {
 	if err := sink.Stop(); err != nil {
 		return err
 	}
-	*sink = *newPGXSink(batchTxSize)
+	// wait until CleanFn has fully returned, then re-arm the sink in place.
+	// Replacing the whole struct value would race the background apply
+	// goroutine that is still releasing its cleanup lock; Reset keeps the same
+	// BaseSink header and only resets its state machine.
+	if ch := sink.Cleaned(); ch != nil {
+		<-ch
+	}
+	sink.BaseSink.Reset()
+
+	fresh := newPGXSink(batchTxSize)
+	sink.ConnStr = fresh.ConnStr
+	sink.SourceID = fresh.SourceID
+	sink.Renice = fresh.Renice
+	sink.LogReader = fresh.LogReader
+	sink.BatchTXSize = fresh.BatchTXSize
+	sink.MaxSpoolBytes = fresh.MaxSpoolBytes
+	sink.InsertBatchSize = fresh.InsertBatchSize
+	sink.conn = nil
+	sink.raw = nil
+	sink.pipeline = nil
+	sink.schema = nil
+	sink.log = nil
+	sink.prev = cursor.Checkpoint{}
+	sink.pgSrcID = pgtype.Text{}
+	sink.pgVersion = 0
+	sink.replLag = -1
+	sink.skip = nil
+	sink.inserts = insertBatch{}
+	sink.prevDDL = 0
+	sink.inTX = false
+	sink.pendingChanges = nil
+	sink.pendingCommits = nil
+	sink.spoolBytes = 0
+	sink.spoolHighWater = 0
+	sink.streamedSpoolBytes = 0
+	sink.txOpen = false
+	sink.fatal = false
 	if _, err := sink.Setup(); err != nil {
 		return err
 	}

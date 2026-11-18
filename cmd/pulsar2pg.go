@@ -10,13 +10,14 @@ import (
 )
 
 var (
-	SinkPGConnURL       string
-	SinkPGLogPath       string
-	SourcePulsarURL     string
-	SourcePulsarTopic   string
-	SourceReaderPrefix  string
-	Renice              int64
-	BatchTXSize         int
+	SinkPGConnURL      string
+	SinkPGLogPath      string
+	SourcePulsarURL    string
+	SourcePulsarTopic  string
+	SourceReaderPrefix string
+	Renice             int64
+	BatchTXSize        int
+	MaxSpoolBytes      int64
 )
 
 func init() {
@@ -28,6 +29,7 @@ func init() {
 	pulsar2pg.Flags().StringVarP(&SourceReaderPrefix, "ReaderPrefix", "", "", "subscription role prefix for pulsar reader")
 	pulsar2pg.Flags().Int64VarP(&Renice, "Renice", "", -10, "try renice the sink pg process")
 	pulsar2pg.Flags().IntVarP(&BatchTXSize, "BatchTxSize", "", 100, "the max number of tx in a pipeline")
+	pulsar2pg.Flags().Int64VarP(&MaxSpoolBytes, "MaxSpoolBytes", "", 0, "the max in-memory bytes a source transaction may spool before it is streamed inside the open SQL transaction (0 uses the sink default)")
 	pulsar2pg.MarkFlagRequired("PGConnURL")
 	pulsar2pg.MarkFlagRequired("PulsarURL")
 	pulsar2pg.MarkFlagRequired("PulsarTopic")
@@ -37,7 +39,7 @@ var pulsar2pg = &cobra.Command{
 	Use:   "pulsar2pg",
 	Short: "Apply logical replication logs to a PostgreSQL from a Pulsar Topic",
 	RunE: func(cmd *cobra.Command, args []string) (err error) {
-		pgSink := &sink.PGXSink{ConnStr: SinkPGConnURL, SourceID: trimSlot(SourcePulsarTopic), Renice: Renice, LogReader: nil, BatchTXSize: BatchTXSize}
+		pgSink := &sink.PGXSink{ConnStr: SinkPGConnURL, SourceID: trimSlot(SourcePulsarTopic), Renice: Renice, LogReader: nil, BatchTXSize: BatchTXSize, MaxSpoolBytes: MaxSpoolBytes}
 		if SinkPGLogPath != "" {
 			pgLog, err := os.Open(SinkPGLogPath)
 			if err != nil {
